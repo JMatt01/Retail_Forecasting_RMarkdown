@@ -1,0 +1,236 @@
+---
+title: "RetailForecast"
+output: html_document
+date: "2026-04-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(dplyr)
+library(tsibble)
+library(feasts)
+library(ggplot2)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r}
+df <- read.csv('/Users/johnmatthewsarong/Personal Projects/CSV/retail_sales.csv')
+unique(df$store_id)   # Checking the unique values in store columns
+unique(df$item_id)    # Checking the unique values in item columns
+sum(is.na(df))        # Checking for missing values
+summary(df)           # Visualizing the dataset summary
+head(df, 10)          # Checking frst 10 values
+tail(df, 10)
+```
+```{r}
+# Checking for outliers in sales column
+Q1 <- quantile(df[['sales']], 0.25)
+Q3 <- quantile(df[['sales']], 0.75)
+IQR <- Q3 - Q1
+
+lower <- Q1 - 1.5 * IQR
+upper <- Q3 + 1.5 * IQR
+
+mask = df[['sales']] < lower | df[['sales']] > upper
+outliers = df[mask, ]
+summary(outliers[['sales']])
+
+hist(df[['sales']], breaks = 30,
+     main = 'Histogram of Sales',
+     xlab = 'Sales',
+     ylab = 'Frequency')
+
+sum(mask)
+
+# Filter out duplicates: Keep the first instance
+df <- df %>% distinct(date, .keep_all = TRUE)
+```
+**Outlier Handling**
+  After appling the IQR rule, I ibserved that there are huge amount of outliers. After visualizing the histogram, I also found that the sales distribution is heavily right-skewed. Further, I am not removing outliers as they could represent actual sales from busy days.
+
+``` {r}
+class(df$date)                                  # Date column is a character
+df <- df %>% mutate(date = as.Date(date))       # Mutate the column into dates
+
+# Convert the dataframe into a tsibble for forecasting
+df_ts <- df %>% as_tsibble(index=date)
+autoplot(df_ts) + 
+  labs(title = 'Daily Sales Over Time',
+           x = 'Date',
+           y = 'Sales') + theme (
+             plot.title = element_text(face = 'bold')
+           )
+```
+
+**Time Series Shape**
+  The time series shows a slight upward trend over the years. More importantly, the data displays strong seasonality with repeating peaks and troughs.
+  
+```{r}
+gg_season(df_ts) + 
+  labs(title = 'Seasonal Plot of Sales',
+           x = 'Date',
+           y = 'Sale') + theme ( 
+             plot.title = element_text(face = 'bold')
+             )
+
+# Create an aggregate monthly data to create a subseries plot
+df_monthly <- df_ts %>%
+  index_by(month = yearmonth(date)) %>%
+  summarise(sales = mean(sales))
+
+gg_subseries(df_monthly) +
+  labs(title = 'Subseries Plot of Sales',
+           x = 'Month',
+           y = 'Sales') + theme (
+             plot.title = element_text(face = 'bold')
+           )
+```
+**Busiest Months**
+  The subseries plot displays each month separately, with the blue horizontal line representing the average sales for that month across all years. By comparing the height of these blue lines across panels, we can identify which months are the busiest on average. Months with higher mean lines correspond to periods of stronger demand, while lower lines indicate slower months. Thus, busiest month across all years is April while slowest is October.
+
+```{r}
+df_monthly %>%
+  model(STL(sales)) %>%
+  components() %>%
+  autoplot()
+
+# library(fpp3)
+df_monthly <- df_monthly |> fill_gaps()             # Fill gaps as NA as the dataset ends at July 2023
+
+fit <- df_monthly |> model(ETS(sales))
+report(fit)
+
+fc <- fit |> forecast(h = "12 months")
+autoplot(fc, df_monthly) + 
+  labs(title ='ETS Forecast (M-A-M)',
+           x = 'Month',
+           y = 'Sales') + theme (
+             plot.title = element_text(face = 'bold')
+           )
+```
+
+```{r}
+# Checking the accuracy of the forecast
+train <- df_monthly |> filter(month <= yearmonth("2021 Dec"))
+test  <- df_monthly |> filter(month >= yearmonth("2022 Jan") & month <= yearmonth("2022 Dec"))
+
+fit_train <- train |> 
+  model(ETS(sales ~ error("M") + trend("A") + season("M")))
+fc <- fit_train |> forecast(h = nrow(test))
+
+accuracy(fc, test)
+autoplot(test, sales) +
+  autolayer(fc, sales, alpha = 0.3, size = 0.9, colour = "blue") +
+  labs(
+    title = "Actual vs ETS Forecasted Sales of Year 2022",
+    x = "Month",
+    y = "Sales"
+  ) + theme (
+             plot.title = element_text(face = 'bold')
+           )
+```
+
+```{r}
+# Making an ARIMA forecast
+fit_arima <- train |> model(ARIMA(sales))
+report(fit_arima)
+
+fc_arima <- fit_arima |> forecast(h = nrow(test))
+accuracy(fc_arima, test)
+
+autoplot(test, sales) +
+  autolayer(fc_arima, sales, alpha = 0.3, colour = "red", size = 0.9) +
+  labs(
+    title = "Actual vs ARIMA Forecasted Sales of Year 2022",
+    x = "Month",
+    y = "Sales"
+  ) + theme (
+             plot.title = element_text(face = 'bold')
+           )
+
+combined_accuracy <- bind_rows(
+  accuracy(fc, test) |> mutate(model = "ETS"),
+  accuracy(fc_arima, test) |> mutate(model = "ARIMA")
+) |> 
+  select(model, ME, RMSE, MAE, MPE, MAPE, MASE, RMSSE, ACF1)
+
+aic_table <- bind_rows(
+  glance(fit_train) |> mutate(model = "ETS"),
+  glance(fit_arima) |> mutate(model = "ARIMA")
+) |> 
+  select(model, AIC, AICc, BIC)
+
+aic_table
+combined_accuracy
+```
+
+**AIC and Forecast Accuracy**
+  From the statistics aboce, ARIMA has the better model fit. However, combined accuracy table shows that the ETS model has lower forecast errors (MAE, MAPE, RMSE). In conclusion, while ARIMA fits better with historical data, ETS is more accurate with unseen data.
+  
+``` {r}
+final_fit <- df_monthly |>
+  model(ETS(sales ~ error("M") + trend("A") + season("M")))
+final_fc <- final_fit |> forecast(h = "12 months")
+
+autoplot(df_monthly, sales, colour = "black") +
+  autolayer(final_fc, .mean, alpha = 0.6, colour = "blue", size = 1.0) +
+  labs(
+    title = "Final ETS(M,A,M) Forecast for 2024",
+    x = "Month",
+    y = "Sales"
+  ) + theme (
+             plot.title = element_text(face = 'bold')
+           )
+```
+
+``` {r}
+# Further  analysis
+# Visualizing the weekday data
+daily_data <- df
+daily_data |>
+  group_by(weekday) |>                      # Group by weekday
+  summarise(avg_sales = mean(sales)) |>     # Summarize the average sales
+  arrange(desc(avg_sales)) |>               # Arrange average sales into descending order
+  ggplot(aes(x = weekday, y = avg_sales)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average Sales by Weekday")                
+
+# Checking Promo effectiveness
+daily_data |>
+  group_by(promo) |>
+  summarise(avg_sales = mean(sales)) |>
+  ggplot(aes(x = promo, y = avg_sales)) +
+  geom_col(fill = "steelblue") +
+  labs(title = "Average Sales by Promo") 
+
+# Looking at the percent increase
+no <- mean(daily_data$sales[daily_data$promo == 0])
+yes <- mean(daily_data$sales[daily_data$promo == 1])
+percent_change <- ((yes - no) / no) * 100
+percent_change
+
+cor(daily_data$price, daily_data$sales)
+```
+
+**Promo Days**
+Sales increased by 51.33% on promo days vs non-promo days. Further, there is a moderate negative relationship between price and sales, when price goes down, sales tend to go up and vice versa. 
+
+``` {r}
+model <- lm(sales ~ price + promo + factor(weekday), data = daily_data)
+summary(model)
+```
+
+**Statistical Analysis**
+  The regression model shows that price has a strong and statistically negative effect towards sales. On average, increasing price by 1 unit reduces sales by 4.93 units. Weekday effects are also significant. Analysis shows that weekdays 1-3 shows igher sales relative to weekday 0, with weekday 2 being the busiest (+9.22). Weekdays 4–6 show lower sales, with weekday 5 being the slowest (–8.66 units). Overall, both price and weekday meaningfully explain variation in daily sales. 
